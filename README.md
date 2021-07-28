@@ -2,7 +2,9 @@
 ## Unofficial Pytorch implementation of "Grad-TTS: A Diffusion Probabilistic Model for Text-to-Speech" ([arxiv](https://arxiv.org/abs/2105.06337))
 
 ## About this repo
-This is an unofficial implementation of GradTTS. We created this project based on GlowTTS (https://github.com/jaywalnut310/glow-tts). We replace the GlowDecoder with DiffusionDecoder which follows the settings of the original paper. In addition, we also replace torch.distributed with horovod for convenience and we don't use fp16 now.
+This is an unofficial implementation of GradTTS. We created this project based on GlowTTS (https://github.com/jaywalnut310/glow-tts). We replace the GlowDecoder with DiffusionDecoder which follows the settings of the original paper. 
+
+Orignal author of this repo replaced torch.distributed with horovod. For convience of installation on our GPU cluster, I have replaced back horovod to torch.distributed. The pretrained model trained on LJS dataset will be released soon.
 
 ## Updates
 
