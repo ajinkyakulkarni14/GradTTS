@@ -9,16 +9,18 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torch.multiprocessing as mp
 import torch.distributed as dist
+from apex.parallel import DistributedDataParallel as DDP
+from apex import amp
 
 from data_utils import TextMelLoader, TextMelCollate
 import models
 import commons
 import utils
 from text.symbols import symbols
-import horovod.torch as hvd
+#import horovod.torch as hvd
 
-hvd.init()
-torch.cuda.set_device(hvd.local_rank())                            
+#hvd.init()
+#torch.cuda.set_device(hvd.local_rank())                            
 
 global_step = 0
 
@@ -28,49 +30,57 @@ def main():
   assert torch.cuda.is_available(), "CPU training is not allowed."
 
   n_gpus = torch.cuda.device_count()
+  os.environ['MASTER_ADDR'] = 'localhost'
+  os.environ['MASTER_PORT'] = '80000'
+
   hps = utils.get_hparams()
-  train_and_eval(n_gpus, hps)
+  mp.spawn(train_and_eval, nprocs=n_gpus, args=(n_gpus, hps,))
+  
 
 
-def train_and_eval(n_gpus, hps):
+def train_and_eval(rank, n_gpus, hps):
   global global_step
-  if hvd.local_rank() == 0:
+  if rank == 0:
     logger = utils.get_logger(hps.model_dir)
     logger.info(hps)
     utils.check_git_hash(hps.model_dir)
     writer = SummaryWriter(log_dir=hps.model_dir)
     writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
-  torch.manual_seed(hps.train.seed)
 
+  dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
+  torch.manual_seed(hps.train.seed)
+  torch.cuda.set_device(rank)
+  
   train_dataset = TextMelLoader(hps.data.training_files, hps.data)
   train_sampler = torch.utils.data.distributed.DistributedSampler(
       train_dataset,
-      num_replicas=hvd.size(),
-      rank=hvd.rank(),
+      num_replicas=n_gpus,
+      rank=rank,
       shuffle=True)
   collate_fn = TextMelCollate(1)
   train_loader = DataLoader(train_dataset, num_workers=8, shuffle=False,
       batch_size=hps.train.batch_size, pin_memory=True,
       drop_last=True, collate_fn=collate_fn, sampler=train_sampler)
-  if hvd.local_rank() == 0:
+  if rank == 0:
     val_dataset = TextMelLoader(hps.data.validation_files, hps.data)
     val_loader = DataLoader(val_dataset, num_workers=8, shuffle=False,
         batch_size=hps.train.batch_size, pin_memory=True,
         drop_last=True, collate_fn=collate_fn)
-
+        
   generator = models.DiffusionGenerator(
       n_vocab=len(symbols) + getattr(hps.data, "add_blank", False), 
       enc_out_channels=hps.data.n_mel_channels,
-      **hps.model).cuda(hvd.local_rank())
-
+      **hps.model).cuda(rank)
+      
   optimizer_g = commons.Adam(scheduler=hps.train.scheduler, dim_model=hps.model.hidden_channels, lr=hps.train.learning_rate)
   t_optimizer = torch.optim.Adam(generator.parameters(), lr=optimizer_g.get_lr(), betas=hps.train.betas, eps=hps.train.eps)
-  t_optimizer = hvd.DistributedOptimizer(t_optimizer, named_parameters=generator.named_parameters()) 
-  hvd.broadcast_parameters(generator.state_dict(), root_rank=0)
+  #t_optimizer = hvd.DistributedOptimizer(t_optimizer, named_parameters=generator.named_parameters()) 
+  #hvd.broadcast_parameters(generator.state_dict(), root_rank=0)
   optimizer_g.set_optimizer(t_optimizer)
-
+  
   if hps.train.fp16_run:
     generator, optimizer_g._optim = amp.initialize(generator, optimizer_g._optim, opt_level="O1")
+  generator = DDP(generator)  
   epoch_str = 1
   global_step = 0
   try:
@@ -84,14 +94,14 @@ def train_and_eval(n_gpus, hps):
       _ = utils.load_checkpoint(os.path.join(hps.model_dir, "ddi_G.pth"), generator, optimizer_g)
   
   for epoch in range(epoch_str, hps.train.epochs + 1):
-    if hvd.local_rank()==0:
-      train(hvd.local_rank(), epoch, hps, generator, optimizer_g, train_loader, logger, writer)
-      evaluate(hvd.local_rank(), epoch, hps, generator, optimizer_g, val_loader, logger, writer_eval)
+    if rank==0:
+      train(rank, epoch, hps, generator, optimizer_g, train_loader, logger, writer)
+      evaluate(rank, epoch, hps, generator, optimizer_g, val_loader, logger, writer_eval)
       utils.save_checkpoint(generator, optimizer_g, hps.train.learning_rate, epoch, os.path.join(hps.model_dir, "G_{}.pth".format(epoch)))
     else:
-      train(hvd.local_rank(), epoch, hps, generator, optimizer_g, train_loader, None, None)
-
-
+      train(rank, epoch, hps, generator, optimizer_g, train_loader, None, None)
+      
+      
 def train(rank, epoch, hps, generator, optimizer_g, train_loader, logger, writer):
   train_loader.sampler.set_epoch(epoch)
   global global_step
@@ -188,6 +198,9 @@ def evaluate(rank, epoch, hps, generator, optimizer_g, val_loader, logger, write
       scalars=scalar_dict)
     logger.info('====> Epoch: {}'.format(epoch))
 
-                           
+
+  
+
 if __name__ == "__main__":
   main()
+  
